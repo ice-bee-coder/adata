@@ -10,6 +10,8 @@
 
 import threading
 import time
+from collections import deque
+from urllib.parse import urlparse
 
 import requests
 
@@ -41,10 +43,70 @@ class SunProxy(object):
             del cls._data[key]
 
 
+class RateLimiter(object):
+    _instance_lock = threading.Lock()
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._init()
+        return cls._instance
+
+    def _init(self):
+        self._default_limit = 30
+        self._domain_limits = {}
+        self._domain_records = {}
+        self._lock = threading.Lock()
+
+    def set_limit(self, limit, domain=None):
+        with self._lock:
+            if domain:
+                self._domain_limits[domain] = limit
+            else:
+                self._default_limit = limit
+
+    def get_limit(self, domain=None):
+        with self._lock:
+            return self._domain_limits.get(domain, self._default_limit)
+
+    def _get_domain(self, url):
+        parsed = urlparse(url)
+        return parsed.netloc
+
+    def acquire(self, url):
+        domain = self._get_domain(url)
+        limit = self.get_limit(domain)
+        now = time.time()
+        window_start = now - 60
+
+        with self._lock:
+            if domain not in self._domain_records:
+                self._domain_records[domain] = deque()
+
+            records = self._domain_records[domain]
+
+            while records and records[0] < window_start:
+                records.popleft()
+
+            if len(records) >= limit:
+                wait_time = records[0] + 60 - now
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                while records and records[0] < time.time() - 60:
+                    records.popleft()
+
+            records.append(time.time())
+            return True
+
+
 class SunRequests(object):
     def __init__(self, sun_proxy: SunProxy = None) -> None:
         super().__init__()
         self.sun_proxy = sun_proxy
+        self._rate_limiter = RateLimiter()
 
     def request(self, method='get', url=None, times=3, retry_wait_time=1588, proxies=None, wait_time=None, **kwargs):
         """
@@ -58,9 +120,10 @@ class SunRequests(object):
         :param kwargs: 其它 requests 参数，用法相同
         :return: res
         """
-        # 1. 获取设置代理
+        if url:
+            self._rate_limiter.acquire(url)
+        
         proxies = self.__get_proxies(proxies)
-        # 2. 请求数据结果
         res = None
         for i in range(times):
             if wait_time:
@@ -74,9 +137,6 @@ class SunRequests(object):
         return res
 
     def __get_proxies(self, proxies):
-        """
-        获取代理配置
-        """
         if proxies is None:
             proxies = {}
         is_proxy = SunProxy.get('is_proxy')
@@ -88,6 +148,14 @@ class SunRequests(object):
         if is_proxy and ip:
             proxies = {'https': f"http://{ip}", 'http': f"http://{ip}"}
         return proxies
+
+
+def set_rate_limit(limit, domain=None):
+    RateLimiter().set_limit(limit, domain)
+
+
+def get_rate_limit(domain=None):
+    return RateLimiter().get_limit(domain)
 
 
 sun_requests = SunRequests()
